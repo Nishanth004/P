@@ -1,4 +1,4 @@
-# client/data_simulator.py
+# client/data_simulator.py - improved version
 import numpy as np
 import logging
 from .config import NUM_SAMPLES, FEATURE_COUNT, THREAT_RATIO
@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 def generate_data(client_id):
     """
-    Generates synthetic security log data for a client.
+    Generates synthetic security log data for a client with clearer patterns.
     Each client might have slightly different data characteristics.
     """
     # Simulate slight variations based on client ID hash
@@ -18,13 +18,13 @@ def generate_data(client_id):
     num_normal = NUM_SAMPLES - num_threats
 
     # Generate normal data (e.g., lower values for certain features)
-    normal_data = np.random.rand(num_normal, FEATURE_COUNT) * 0.5 # Scale normal data features
-
-    # Generate threat data (e.g., higher values for specific features)
-    threat_data = np.random.rand(num_threats, FEATURE_COUNT)
-    # Make some features significantly different for threats (e.g., last 3 features)
-    threat_data[:, -3:] = 0.5 + np.random.rand(num_threats, 3) * 0.8 # Higher values and variance
-
+    normal_data = np.random.rand(num_normal, FEATURE_COUNT) * 0.4  # Scale normal data features
+    
+    # Generate threat data with stronger signal
+    threat_data = np.random.rand(num_threats, FEATURE_COUNT) * 0.3
+    # Make threat features much more distinctive (last 3 features)
+    threat_data[:, -3:] = 0.7 + np.random.rand(num_threats, 3) * 0.3
+    
     # Add client-specific bias (example: shift one feature slightly)
     bias_feature_index = hash(client_id + "bias") % FEATURE_COUNT
     bias_amount = (hash(client_id + "amount") % 100 / 500.0) - 0.1 # Small bias +/-
@@ -42,4 +42,6 @@ def generate_data(client_id):
     y = y[indices]
 
     logger.info(f"Client {client_id}: Generated {NUM_SAMPLES} samples ({num_threats} threats, {num_normal} normal).")
+    logger.info(f"Sample threat features mean: {np.mean(threat_data[:, -3:]):.4f}, normal features mean: {np.mean(normal_data[:, -3:]):.4f}")
+    
     return X, y
