@@ -1,265 +1,179 @@
-# server/main.py
-from flask import Flask, request, jsonify
+# server/model_manager.py
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import joblib
+import os
 import logging
-import time
-import threading
-import json # Added for parsing
-from concurrent.futures import ThreadPoolExecutor
+from .config import MODEL_FEATURE_COUNT, PRECISION_FACTOR, ENABLE_QIFA_MOMENTUM, QIFA_MOMENTUM
 
-
-import sys
-sys.path.append("..")  # Add parent directory to path
-from benchmark_tracker import BenchmarkTracker
-
-from . import crypto_manager
-from . import model_manager
-from .config import (
-    SERVER_HOST, SERVER_PORT, NUM_ROUNDS, CLIENTS_PER_ROUND,
-    MIN_CLIENTS_FOR_AGGREGATION, ENABLE_QKD_SIMULATION,ENABLE_QIFA_MOMENTUM, QKD_KEY_LENGTH
-) # Import QKD config
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+MODEL_FILE = 'server/global_model.pkl'
+qifa_velocity = None # State variable for QIFA momentum
 
-# ... (executor, global state variables remain the same) ...
-client_registry = {} # client_id -> last_seen
-round_updates = {} # round_number -> {client_id: encrypted_update_json}
-current_round = 0
-global_model = None
-server_lock = threading.Lock()
-executor = ThreadPoolExecutor(max_workers=4)
+def initialize_global_model():
+    """Initializes a new global Logistic Regression model with better initialization."""
+    global qifa_velocity
+    # Initialize with small random weights to break symmetry
+    model = LogisticRegression(warm_start=True, solver='liblinear', max_iter=100, C=1.0)
+    
+    # Fitting with dummy data helps set the 'classes_' attribute
+    dummy_X = np.zeros((2, MODEL_FEATURE_COUNT))
+    dummy_y = np.array([0, 1]) # Ensure both classes are seen
+    model.fit(dummy_X, dummy_y)
+    
+    # Ensure non-zero initialization of weights
+    initial_weights = np.random.normal(0, 0.01, MODEL_FEATURE_COUNT)
+    model.coef_ = initial_weights.reshape(1, -1)
+    model.intercept_ = np.array([0.0])
+    
+    logger.info(f"Initialized global model with {MODEL_FEATURE_COUNT} features.")
+    logger.info(f"Initial weights (random): {model.coef_}")
+    
+    save_model(model)
+    # Initialize QIFA velocity state
+    qifa_velocity = np.zeros_like(get_model_weights(model))
+    logger.info("Initialized QIFA momentum velocity.")
+    return model
 
-def initialize_server():
-    """Initialize server components."""
-    global global_model
-    logger.info("Initializing orchestrator server...")
-    crypto_manager.generate_keys() # Generates HE keys
-    global_model = model_manager.load_model() # Loads model & initializes QIFA velocity
-    logger.info("Server initialized.")
-
-# --- Modified Registration Endpoint for QKD Simulation ---
-@app.route('/register', methods=['POST'])
-def register_client():
-    """Allows clients to register. Optionally performs simulated QKD."""
-    data = request.json
-    client_id = data.get('client_id')
-    if not client_id:
-        return jsonify({"error": "Client ID required"}), 400
-
-    serialized_he_pub_key = crypto_manager.get_serialized_public_key()
-    qkd_bases_bob = None
-    qkd_shared_key = None # Store the derived key conceptually
-
-    # --- Simulated QKD Exchange ---
-    if ENABLE_QKD_SIMULATION:
-        alice_bases_str = data.get('qkd_alice_bases')
-        if alice_bases_str:
-            logger.info(f"QKD Simulation: Received Alice's bases from {client_id}. Simulating Bob's side...")
-            qkd_bases_bob, qkd_shared_key = crypto_manager.simulate_qkd_server_protocol(client_id, alice_bases_str)
-            if qkd_shared_key:
-                logger.info(f"QKD Simulation: Derived shared key for {client_id}. This key would ideally encrypt the HE public key transmission.")
-                # In a real implementation:
-                # encrypted_he_pub_key = encrypt_with_aes_gcm(serialized_he_pub_key, qkd_shared_key)
-                # response_data['encrypted_he_public_key'] = encrypted_he_pub_key
-            else:
-                logger.error(f"QKD Simulation Failed for {client_id}. Proceeding without QKD protection.")
-                # Fallback: Send unencrypted (as done currently) or deny registration
-        else:
-            logger.warning(f"Client {client_id} registered but did not provide QKD bases (QKD enabled).")
-            # Decide policy: allow registration without QKD or deny? Allowing for now.
-
-    # Store client info (simplified)
-    with server_lock:
-        client_registry[client_id] = {'last_seen': time.time(), 'qkd_key': qkd_shared_key}
-
-    # Prepare response
-    response_data = {
-        "message": "Registered successfully",
-        "public_key": json.loads(serialized_he_pub_key), # Send standard public key (simulation only)
-        "feature_count": model_manager.MODEL_FEATURE_COUNT
-    }
-    if qkd_bases_bob is not None:
-         response_data["qkd_bob_bases"] = qkd_bases_bob # Send Bob's bases for client reconciliation simulation
-
-    logger.info(f"Client {client_id} registered.")
-    return jsonify(response_data)
-
-# --- /get_model endpoint (Unchanged) ---
-@app.route('/get_model', methods=['GET'])
-def get_model():
-    # ... (no changes needed) ...
-    client_id = request.args.get('client_id')
-    request_round = request.args.get('round', type=int)
-    if not client_id or client_id not in client_registry:
-         return jsonify({"error": "Client not registered or invalid ID"}), 403
-    if request_round != current_round:
-         return jsonify({"error": f"Requesting model for wrong round ({request_round}), current is {current_round}"}), 400
-    model_weights = model_manager.get_model_weights(global_model)
-    logger.info(f"Sending model (round {current_round}) to client {client_id}")
-    return jsonify({
-        "round": current_round,
-        "weights": model_weights.tolist()
-        })
-
-
-# --- /submit_update endpoint (Unchanged) ---
-@app.route('/submit_update', methods=['POST'])
-def submit_update():
-    # ... (no changes needed) ...
-    data = request.json
-    client_id = data.get('client_id')
-    round_num = data.get('round')
-    encrypted_update_json = data.get('update') # This is already JSON string from client
-
-    if not client_id or client_id not in client_registry:
-        return jsonify({"error": "Client not registered or invalid ID"}), 403
-    if round_num != current_round:
-        return jsonify({"error": f"Update submitted for wrong round ({round_num}), current is {current_round}"}), 400
-    if not encrypted_update_json:
-         return jsonify({"error": "Encrypted update missing"}), 400
-
-    with server_lock:
-        if current_round not in round_updates:
-            round_updates[current_round] = {}
-        if client_id in round_updates[current_round]:
-            logger.warning(f"Client {client_id} already submitted update for round {current_round}. Ignoring.")
-            return jsonify({"message": "Update already received for this round"}), 200
-
-        round_updates[current_round][client_id] = encrypted_update_json
-        logger.info(f"Received encrypted update from {client_id} for round {current_round}. Total updates this round: {len(round_updates[current_round])}")
-
-        if len(round_updates[current_round]) >= MIN_CLIENTS_FOR_AGGREGATION:
-             logger.info(f"Minimum updates ({MIN_CLIENTS_FOR_AGGREGATION}) reached for round {current_round}. Aggregation can proceed.")
-
-    return jsonify({"message": "Update received successfully"})
-
-
-# --- Modified Federated Round Logic ---
-def run_federated_round(round_num):
-    """Manages a single round of federated learning."""
-    global global_model, current_round
-    logger.info(f"--- Starting Federated Round {round_num} ---")
-
-    with server_lock:
-        current_round = round_num
-        round_updates[current_round] = {} # Clear updates for the new round
-
-    logger.info(f"Waiting for client updates for round {round_num}...")
-    round_start_time = time.time()
-    wait_time_seconds = 60
-
-    while time.time() - round_start_time < wait_time_seconds:
-        with server_lock:
-             num_received = len(round_updates.get(current_round, {}))
-        if num_received >= MIN_CLIENTS_FOR_AGGREGATION:
-             logger.info(f"Round {current_round}: Reached minimum {num_received} updates. Proceeding early.")
-             break
-        time.sleep(5)
-
-    # --- Aggregation and Update ---
-    with server_lock:
-        updates_to_process = round_updates.get(current_round, {})
-        num_updates = len(updates_to_process)
-        logger.info(f"Round {current_round} ended. Received {num_updates} updates.")
-
-        if num_updates < MIN_CLIENTS_FOR_AGGREGATION:
-            logger.warning(f"Round {current_round}: Not enough updates ({num_updates}) received. Skipping model update for this round.")
-            return
-
-        # Submit aggregation and decryption to the thread pool
-        logger.info("Submitting aggregation and decryption tasks to executor...")
-        # Pass the list of encrypted update JSON strings
-        future = executor.submit(aggregate_and_decrypt, list(updates_to_process.values()))
-
+def load_model():
+    """Loads the global model from disk."""
+    global qifa_velocity
+    if os.path.exists(MODEL_FILE):
         try:
-            # Result is the decrypted *sum* of scaled updates
-            aggregated_decrypted_updates = future.result(timeout=120)
-
-            if aggregated_decrypted_updates:
-                logger.info("Aggregation and decryption complete. Updating global model.")
-                # The update function now handles averaging and QIFA momentum internally
-                global_model = model_manager.update_global_model(aggregated_decrypted_updates, num_updates)
-
-                logger.info("Evaluating model and checking for autonomous actions...")
-                model_manager.evaluate_model_and_trigger_action(global_model)
-
+            model = joblib.load(MODEL_FILE)
+            if hasattr(model, 'coef_') and model.coef_.shape[1] == MODEL_FEATURE_COUNT:
+                 logger.info(f"Loaded global model from {MODEL_FILE}")
+                 # Initialize QIFA velocity if loading existing model
+                 if qifa_velocity is None:
+                     qifa_velocity = np.zeros_like(get_model_weights(model))
+                     logger.info("Initialized QIFA momentum velocity upon loading model.")
+                 return model
             else:
-                logger.error("Aggregation/decryption failed or returned no result.")
-
+                 logger.warning(f"Model structure in {MODEL_FILE} doesn't match config. Reinitializing.")
+                 return initialize_global_model()
         except Exception as e:
-            logger.error(f"Error during aggregation/decryption task execution: {e}", exc_info=True)
+            logger.error(f"Error loading model from {MODEL_FILE}: {e}. Reinitializing.")
+            return initialize_global_model()
+    else:
+        logger.info(f"No existing model file found at {MODEL_FILE}. Initializing a new one.")
+        return initialize_global_model()
 
-    logger.info(f"--- Federated Round {round_num} Complete ---")
-
-
-def aggregate_and_decrypt(encrypted_updates_list):
-    """
-    Aggregates encrypted updates and decrypts the sum.
-    Args:
-        encrypted_updates_list (list): List of JSON strings, each an encrypted vector.
-    Returns:
-        list: The decrypted aggregated vector (list of integers) or None on failure.
-    """
-    num_clients = len(encrypted_updates_list)
-    if num_clients == 0: return None
+def save_model(model):
+    """Saves the global model to disk."""
     try:
-        logger.info(f"Aggregating {num_clients} encrypted vectors using HE...")
-        aggregated_encrypted_json = crypto_manager.aggregate_encrypted_vectors(encrypted_updates_list)
-        if aggregated_encrypted_json is None:
-            logger.error("HE Aggregation resulted in None.")
-            return None
-
-        logger.info("Decrypting aggregated vector...")
-        start_decrypt_time = time.time()
-        # Decrypts the single aggregated vector
-        aggregated_decrypted_updates = crypto_manager.decrypt_vector(aggregated_encrypted_json)
-        decrypt_time = time.time() - start_decrypt_time
-        logger.info(f"Decryption took {decrypt_time:.4f} seconds.")
-
-        return aggregated_decrypted_updates # Return the list of decrypted summed integers
+        os.makedirs(os.path.dirname(MODEL_FILE), exist_ok=True)
+        joblib.dump(model, MODEL_FILE)
+        logger.info(f"Saved global model to {MODEL_FILE}")
     except Exception as e:
-         logger.error(f"Error in aggregate_and_decrypt: {e}", exc_info=True)
-         return None
+        logger.error(f"Error saving model to {MODEL_FILE}: {e}")
 
 
-def run_server():
-    initialize_server()
-    
-    # Initialize benchmark tracker
-    experiment_name = "qifa_qkd" if ENABLE_QKD_SIMULATION and ENABLE_QIFA_MOMENTUM else \
-                      "qifa" if ENABLE_QIFA_MOMENTUM else \
-                      "qkd" if ENABLE_QKD_SIMULATION else "baseline"
-    
-    tracker = BenchmarkTracker(experiment_name=experiment_name)
-    
-    flask_thread = threading.Thread(target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True), daemon=True)
-    flask_thread.start()
-    logger.info(f"Flask server running on http://{SERVER_HOST}:{SERVER_PORT}")
+def get_model_weights(model):
+    """Extracts model weights (coefficients and intercept)."""
+    weights = np.concatenate([model.coef_.flatten(), model.intercept_])
+    return weights
 
-    # Run federated learning rounds
-    for r in range(NUM_ROUNDS):
-        run_federated_round(r)
+def set_model_weights(model, weights):
+    """Sets model weights from a flat array."""
+    coef_shape = model.coef_.shape
+    intercept_shape = model.intercept_.shape
+    coef_size = np.prod(coef_shape)
+    intercept_size = np.prod(intercept_shape)
+    if len(weights) != coef_size + intercept_size:
+        raise ValueError(f"Incorrect number of weights provided. Expected {coef_size + intercept_size}, got {len(weights)}")
+    model.coef_ = weights[:coef_size].reshape(coef_shape)
+    model.intercept_ = weights[coef_size:].reshape(intercept_shape)
+    return model
+
+# --- QIFA Momentum Application ---
+def apply_qifa_momentum(average_update):
+    """
+    Applies the momentum component of the Quantum-Inspired Federated Averaging.
+    Operates on the already averaged update due to HE constraints.
+    Updates the global qifa_velocity state.
+
+    Args:
+        average_update (np.array): The averaged weight difference vector.
+
+    Returns:
+        np.array: The momentum-adjusted update vector.
+    """
+    global qifa_velocity
+    if not ENABLE_QIFA_MOMENTUM:
+        return average_update # Return original average if QIFA is disabled
+
+    if qifa_velocity is None:
+         logger.warning("QIFA velocity not initialized. Skipping momentum.")
+         return average_update
+
+    if qifa_velocity.shape != average_update.shape:
+        logger.error(f"QIFA velocity shape {qifa_velocity.shape} mismatch with average update shape {average_update.shape}. Reinitializing velocity.")
+        qifa_velocity = np.zeros_like(average_update)
+        # Fallback to standard average update for this round
+        return average_update
+
+    logger.info(f"Applying QIFA momentum (factor: {QIFA_MOMENTUM})...")
+    # Update velocity: v = momentum * v + (1 - momentum) * average_update
+    qifa_velocity = QIFA_MOMENTUM * qifa_velocity + (1 - QIFA_MOMENTUM) * average_update
+
+    logger.info("QIFA momentum applied.")
+    return qifa_velocity # Return the velocity as the adjusted update
+
+
+def update_global_model(aggregated_decrypted_updates, num_clients):
+    """
+    Updates the global model using the averaged decrypted updates,
+    optionally applying QIFA momentum.
+    """
+    global qifa_velocity # Ensure we can access/update the state
+    if num_clients == 0:
+        logger.warning("Cannot update model with zero clients.")
+        return
+
+    global_model = load_model()
+    current_weights = get_model_weights(global_model)
+
+    # Convert aggregated integer updates back to scaled float updates
+    average_scaled_update = np.array(aggregated_decrypted_updates) / num_clients
+    average_update = average_scaled_update / PRECISION_FACTOR
+
+    # --- Apply QIFA Momentum (if enabled) ---
+    if ENABLE_QIFA_MOMENTUM:
+        final_update = apply_qifa_momentum(average_update)
+    else:
+        final_update = average_update # Use standard average if QIFA disabled
+
+    # Apply the final update to the current weights
+    new_weights = current_weights + final_update # Add the (potentially momentum-adjusted) average update
+
+    # Set the updated weights back to the model
+    updated_model = set_model_weights(global_model, new_weights)
+
+    save_model(updated_model)
+    logger.info(f"Global model updated using {'QIFA-momentum adjusted' if ENABLE_QIFA_MOMENTUM else 'standard'} average from {num_clients} clients.")
+
+    return updated_model
+
+
+def evaluate_model_and_trigger_action(model):
+    """Simulates evaluation and autonomous action based on the model's predictions."""
+    from .config import THREAT_THRESHOLD, MODEL_FEATURE_COUNT
+    try:
+        num_samples = 10
+        # Create more distinctive potential threat data
+        potential_threat_data = np.random.rand(num_samples, MODEL_FEATURE_COUNT) * 0.3
+        # Last 3 features have higher values for threats
+        potential_threat_data[:, -3:] *= 5  # Make threat features more pronounced
         
-        # Evaluate model after each round
-        logger.info(f"Evaluating model performance after round {r}")
-        tracker.evaluate_model(r)
+        probabilities = model.predict_proba(potential_threat_data)
+        threat_probabilities = probabilities[:, 1]
+        avg_threat_prob = np.mean(threat_probabilities)
+        logger.info(f"Simulated evaluation: Average threat probability on sample data: {avg_threat_prob:.4f}")
         
-        # Save results after each round for immediate inspection
-        tracker.save_results()
-        
-        time.sleep(5)
-    
-    # Generate convergence plots
-    tracker.plot_convergence(metric='accuracy')
-    tracker.plot_convergence(metric='f1')
-    tracker.plot_convergence(metric='precision')
-    tracker.plot_convergence(metric='recall')
-    tracker.plot_multi_metric()
-    
-    logger.info("Federated learning process finished.")
-    logger.info(f"Benchmark results saved to {tracker.results_dir}")
-
-if __name__ == '__main__':
-    run_server()
+        if avg_threat_prob > THREAT_THRESHOLD:
+            logger.warning(f"AUTONOMOUS ACTION TRIGGERED: Average threat probability {avg_threat_prob:.4f} exceeds threshold {THREAT_THRESHOLD}.")
+            print("\n *** SIMULATING AUTONOMOUS ACTION: Blocking potentially malicious source (simulated) *** \n")
+    except Exception as e:
+        logger.error(f"Error during model evaluation or action trigger: {e}")
