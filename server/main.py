@@ -3,35 +3,42 @@ from flask import Flask, request, jsonify
 import logging
 import time
 import threading
-import json # Added for parsing
+import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from . import crypto_manager
 from . import model_manager
 from .config import (
     SERVER_HOST, SERVER_PORT, NUM_ROUNDS, CLIENTS_PER_ROUND,
-    MIN_CLIENTS_FOR_AGGREGATION, ENABLE_QKD_SIMULATION, QKD_KEY_LENGTH
-) # Import QKD config
+    MIN_CLIENTS_FOR_AGGREGATION, ENABLE_QKD_SIMULATION, QKD_KEY_LENGTH,
+    ENABLE_QIFA_MOMENTUM
+)
+
+# Add parent directory to path for benchmark_tracker
+sys.path.append("..")
+from benchmark_tracker import BenchmarkTracker
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ... (executor, global state variables remain the same) ...
-client_registry = {} # client_id -> last_seen
-round_updates = {} # round_number -> {client_id: encrypted_update_json}
+# Global state variables
+client_registry = {}  # client_id -> last_seen
+round_updates = {}  # round_number -> {client_id: encrypted_update_json}
 current_round = 0
 global_model = None
 server_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=4)
+benchmark_tracker = None  # Will be initialized in run_server()
 
 def initialize_server():
     """Initialize server components."""
     global global_model
     logger.info("Initializing orchestrator server...")
-    crypto_manager.generate_keys() # Generates HE keys
-    global_model = model_manager.load_model() # Loads model & initializes QIFA velocity
+    crypto_manager.generate_keys()  # Generates HE keys
+    global_model = model_manager.load_model()  # Loads model & initializes QIFA velocity
     logger.info("Server initialized.")
 
 # --- Modified Registration Endpoint for QKD Simulation ---
@@ -45,7 +52,7 @@ def register_client():
 
     serialized_he_pub_key = crypto_manager.get_serialized_public_key()
     qkd_bases_bob = None
-    qkd_shared_key = None # Store the derived key conceptually
+    qkd_shared_key = None  # Store the derived key conceptually
 
     # --- Simulated QKD Exchange ---
     if ENABLE_QKD_SIMULATION:
@@ -72,48 +79,48 @@ def register_client():
     # Prepare response
     response_data = {
         "message": "Registered successfully",
-        "public_key": json.loads(serialized_he_pub_key), # Send standard public key (simulation only)
+        "public_key": json.loads(serialized_he_pub_key),  # Send standard public key (simulation only)
         "feature_count": model_manager.MODEL_FEATURE_COUNT
     }
     if qkd_bases_bob is not None:
-         response_data["qkd_bob_bases"] = qkd_bases_bob # Send Bob's bases for client reconciliation simulation
+        response_data["qkd_bob_bases"] = qkd_bases_bob  # Send Bob's bases for client reconciliation simulation
 
     logger.info(f"Client {client_id} registered.")
     return jsonify(response_data)
 
-# --- /get_model endpoint (Unchanged) ---
+# --- /get_model endpoint ---
 @app.route('/get_model', methods=['GET'])
 def get_model():
-    # ... (no changes needed) ...
+    """Provides the current global model to clients."""
     client_id = request.args.get('client_id')
     request_round = request.args.get('round', type=int)
     if not client_id or client_id not in client_registry:
-         return jsonify({"error": "Client not registered or invalid ID"}), 403
+        return jsonify({"error": "Client not registered or invalid ID"}), 403
     if request_round != current_round:
-         return jsonify({"error": f"Requesting model for wrong round ({request_round}), current is {current_round}"}), 400
+        return jsonify({"error": f"Requesting model for wrong round ({request_round}), current is {current_round}"}), 400
     model_weights = model_manager.get_model_weights(global_model)
     logger.info(f"Sending model (round {current_round}) to client {client_id}")
     return jsonify({
         "round": current_round,
         "weights": model_weights.tolist()
-        })
+    })
 
 
-# --- /submit_update endpoint (Unchanged) ---
+# --- /submit_update endpoint ---
 @app.route('/submit_update', methods=['POST'])
 def submit_update():
-    # ... (no changes needed) ...
+    """Receives encrypted model updates from clients."""
     data = request.json
     client_id = data.get('client_id')
     round_num = data.get('round')
-    encrypted_update_json = data.get('update') # This is already JSON string from client
+    encrypted_update_json = data.get('update')  # This is already JSON string from client
 
     if not client_id or client_id not in client_registry:
         return jsonify({"error": "Client not registered or invalid ID"}), 403
     if round_num != current_round:
         return jsonify({"error": f"Update submitted for wrong round ({round_num}), current is {current_round}"}), 400
     if not encrypted_update_json:
-         return jsonify({"error": "Encrypted update missing"}), 400
+        return jsonify({"error": "Encrypted update missing"}), 400
 
     with server_lock:
         if current_round not in round_updates:
@@ -126,7 +133,7 @@ def submit_update():
         logger.info(f"Received encrypted update from {client_id} for round {current_round}. Total updates this round: {len(round_updates[current_round])}")
 
         if len(round_updates[current_round]) >= MIN_CLIENTS_FOR_AGGREGATION:
-             logger.info(f"Minimum updates ({MIN_CLIENTS_FOR_AGGREGATION}) reached for round {current_round}. Aggregation can proceed.")
+            logger.info(f"Minimum updates ({MIN_CLIENTS_FOR_AGGREGATION}) reached for round {current_round}. Aggregation can proceed.")
 
     return jsonify({"message": "Update received successfully"})
 
@@ -139,18 +146,18 @@ def run_federated_round(round_num):
 
     with server_lock:
         current_round = round_num
-        round_updates[current_round] = {} # Clear updates for the new round
+        round_updates[current_round] = {}  # Clear updates for the new round
 
     logger.info(f"Waiting for client updates for round {round_num}...")
     round_start_time = time.time()
-    wait_time_seconds = 60
+    wait_time_seconds = 60  # Timeout for waiting for client updates
 
     while time.time() - round_start_time < wait_time_seconds:
         with server_lock:
-             num_received = len(round_updates.get(current_round, {}))
+            num_received = len(round_updates.get(current_round, {}))
         if num_received >= MIN_CLIENTS_FOR_AGGREGATION:
-             logger.info(f"Round {current_round}: Reached minimum {num_received} updates. Proceeding early.")
-             break
+            logger.info(f"Round {current_round}: Reached minimum {num_received} updates. Proceeding early.")
+            break
         time.sleep(5)
 
     # --- Aggregation and Update ---
@@ -213,23 +220,50 @@ def aggregate_and_decrypt(encrypted_updates_list):
         decrypt_time = time.time() - start_decrypt_time
         logger.info(f"Decryption took {decrypt_time:.4f} seconds.")
 
-        return aggregated_decrypted_updates # Return the list of decrypted summed integers
+        return aggregated_decrypted_updates  # Return the list of decrypted summed integers
     except Exception as e:
-         logger.error(f"Error in aggregate_and_decrypt: {e}", exc_info=True)
-         return None
+        logger.error(f"Error in aggregate_and_decrypt: {e}", exc_info=True)
+        return None
 
 
 def run_server():
+    """Main function to run the server and manage federated rounds."""
+    global benchmark_tracker
     initialize_server()
+    
+    # Initialize benchmark tracker with appropriate experiment name
+    experiment_name = "qifa_qkd" if ENABLE_QKD_SIMULATION and ENABLE_QIFA_MOMENTUM else \
+                      "qifa" if ENABLE_QIFA_MOMENTUM else \
+                      "qkd" if ENABLE_QKD_SIMULATION else "baseline"
+    
+    benchmark_tracker = BenchmarkTracker(experiment_name=experiment_name)
+    
     flask_thread = threading.Thread(target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True), daemon=True)
     flask_thread.start()
     logger.info(f"Flask server running on http://{SERVER_HOST}:{SERVER_PORT}")
 
     for r in range(NUM_ROUNDS):
         run_federated_round(r)
+        
+        # Evaluate model performance after each round
+        logger.info(f"Evaluating model performance after round {r}")
+        benchmark_tracker.evaluate_model(r)
+        
+        # Save results after each round for immediate inspection
+        benchmark_tracker.save_results()
+        
         time.sleep(5)
-
+    
+    # Create plots at the end of all rounds
+    benchmark_tracker.plot_convergence(metric='accuracy')
+    benchmark_tracker.plot_convergence(metric='f1')
+    benchmark_tracker.plot_convergence(metric='precision')
+    benchmark_tracker.plot_convergence(metric='recall')
+    benchmark_tracker.plot_multi_metric()
+    
     logger.info("Federated learning process finished.")
+    logger.info(f"Benchmark results saved to {benchmark_tracker.results_dir}")
+    
     # Keep Flask running... add shutdown if needed
 
 if __name__ == '__main__':
