@@ -1,5 +1,5 @@
 """
-Improved benchmark tracker for Autonomous Cloud Security Orchestrator.
+Enhanced benchmark tracker for Autonomous Cloud Security Orchestrator.
 Ensures model is properly evaluated across federated rounds.
 """
 import os
@@ -47,7 +47,8 @@ class BenchmarkTracker:
             'false_positive_rate': [],
             'evaluation_time': [],
             'timestamp': [],
-            'threat_prob_mean': [] # Average probability of threat class
+            'threat_prob_mean': [], # Average probability of threat class
+            'coef_norm': []  # L2 norm of the coefficient vector
         }
         
         # Generate test data once for consistent evaluation
@@ -70,7 +71,7 @@ class BenchmarkTracker:
         
         # Generate threat data with stronger signal (higher values for specific features)
         threat_data = np.random.rand(num_threats, self.feature_count) * 0.3
-        # Make last 3 features much higher for threats
+        # Make last 3 features much higher for threats - this is the key pattern to learn
         threat_data[:, -3:] = 0.7 + np.random.rand(num_threats, 3) * 0.3
         
         # Print sample data to verify separation
@@ -103,7 +104,11 @@ class BenchmarkTracker:
             start_time = time.time()
             model = joblib.load(model_file)
             
+            # Calculate coefficient L2 norm (to track model growth)
+            coef_norm = np.linalg.norm(model.coef_)
+            
             # Print model coefficients for debugging
+            logger.info(f"Model round {round_num} - coefficient L2 norm: {coef_norm:.6f}")
             logger.info(f"Model coefficients: {model.coef_}")
             logger.info(f"Model intercept: {model.intercept_}")
             
@@ -131,14 +136,14 @@ class BenchmarkTracker:
             except ValueError:
                 # This happens if model predicts only one class
                 logger.warning("Could not calculate confusion matrix - model may predict only one class")
-                if all(y_pred == 0):  # All predictions are negative
+                if np.all(y_pred == 0):  # All predictions are negative
                     tp, fp = 0, 0
-                    tn = sum(self.y_test == 0)
-                    fn = sum(self.y_test == 1)
-                elif all(y_pred == 1):  # All predictions are positive
+                    tn = np.sum(self.y_test == 0)
+                    fn = np.sum(self.y_test == 1)
+                elif np.all(y_pred == 1):  # All predictions are positive
                     tn, fn = 0, 0
-                    tp = sum(self.y_test == 1)
-                    fp = sum(self.y_test == 0)
+                    tp = np.sum(self.y_test == 1)
+                    fp = np.sum(self.y_test == 0)
                 tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
                 fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
             
@@ -156,6 +161,7 @@ class BenchmarkTracker:
             self.results['evaluation_time'].append(float(eval_time))
             self.results['timestamp'].append(time.time())
             self.results['threat_prob_mean'].append(float(np.mean(y_prob)))
+            self.results['coef_norm'].append(float(coef_norm))
             
             logger.info(f"Round {round_num} Metrics: Acc={acc:.4f}, Prec={prec:.4f}, Rec={rec:.4f}, F1={f1:.4f}")
             logger.info(f"Confusion Matrix: TP={tp}, FP={fp}, TN={tn}, FN={fn}")
@@ -169,7 +175,8 @@ class BenchmarkTracker:
                 'true_positive_rate': tpr,
                 'false_positive_rate': fpr,
                 'evaluation_time': eval_time,
-                'threat_prob_mean': float(np.mean(y_prob))
+                'threat_prob_mean': float(np.mean(y_prob)),
+                'coef_norm': float(coef_norm)
             }
             
         except Exception as e:
