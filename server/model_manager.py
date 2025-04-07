@@ -4,24 +4,33 @@ from sklearn.linear_model import LogisticRegression
 import joblib
 import os
 import logging
-from .config import MODEL_FEATURE_COUNT, PRECISION_FACTOR, ENABLE_QIFA_MOMENTUM, QIFA_MOMENTUM # Import QIFA params
+from .config import MODEL_FEATURE_COUNT, PRECISION_FACTOR, ENABLE_QIFA_MOMENTUM, QIFA_MOMENTUM
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MODEL_FILE = 'server/global_model.pkl'
-qifa_velocity = None # State variable for QIFA momentum
+qifa_velocity = None  # State variable for QIFA momentum
 
 def initialize_global_model():
-    """Initializes a new global Logistic Regression model."""
+    """Initializes a new global Logistic Regression model with better initialization."""
     global qifa_velocity
-    # Initialize with zeros or small random weights
+    # Initialize with small random weights to break symmetry
+    model = LogisticRegression(warm_start=True, solver='liblinear', max_iter=100, C=1.0)
+    
     # Fitting with dummy data helps set the 'classes_' attribute
-    model = LogisticRegression(warm_start=True, max_iter=1) # warm_start allows incremental updates
     dummy_X = np.zeros((2, MODEL_FEATURE_COUNT))
-    dummy_y = np.array([0, 1]) # Ensure both classes are seen
+    dummy_y = np.array([0, 1])  # Ensure both classes are seen
     model.fit(dummy_X, dummy_y)
+    
+    # Ensure non-zero initialization of weights
+    initial_weights = np.random.normal(0, 0.01, MODEL_FEATURE_COUNT)
+    model.coef_ = initial_weights.reshape(1, -1)
+    model.intercept_ = np.array([0.0])
+    
     logger.info(f"Initialized global model with {MODEL_FEATURE_COUNT} features.")
+    logger.info(f"Initial weights (random): {model.coef_}")
+    
     save_model(model)
     # Initialize QIFA velocity state
     qifa_velocity = np.zeros_like(get_model_weights(model))
@@ -35,15 +44,15 @@ def load_model():
         try:
             model = joblib.load(MODEL_FILE)
             if hasattr(model, 'coef_') and model.coef_.shape[1] == MODEL_FEATURE_COUNT:
-                 logger.info(f"Loaded global model from {MODEL_FILE}")
-                 # Initialize QIFA velocity if loading existing model
-                 if qifa_velocity is None:
-                     qifa_velocity = np.zeros_like(get_model_weights(model))
-                     logger.info("Initialized QIFA momentum velocity upon loading model.")
-                 return model
+                logger.info(f"Loaded global model from {MODEL_FILE}")
+                # Initialize QIFA velocity if loading existing model
+                if qifa_velocity is None:
+                    qifa_velocity = np.zeros_like(get_model_weights(model))
+                    logger.info("Initialized QIFA momentum velocity upon loading model.")
+                return model
             else:
-                 logger.warning(f"Model structure in {MODEL_FILE} doesn't match config. Reinitializing.")
-                 return initialize_global_model()
+                logger.warning(f"Model structure in {MODEL_FILE} doesn't match config. Reinitializing.")
+                return initialize_global_model()
         except Exception as e:
             logger.error(f"Error loading model from {MODEL_FILE}: {e}. Reinitializing.")
             return initialize_global_model()
@@ -62,12 +71,12 @@ def save_model(model):
 
 
 def get_model_weights(model):
-    # ... (no changes needed)
+    """Extracts model weights (coefficients and intercept)."""
     weights = np.concatenate([model.coef_.flatten(), model.intercept_])
     return weights
 
 def set_model_weights(model, weights):
-    # ... (no changes needed)
+    """Sets model weights from a flat array."""
     coef_shape = model.coef_.shape
     intercept_shape = model.intercept_.shape
     coef_size = np.prod(coef_shape)
@@ -93,11 +102,11 @@ def apply_qifa_momentum(average_update):
     """
     global qifa_velocity
     if not ENABLE_QIFA_MOMENTUM:
-        return average_update # Return original average if QIFA is disabled
+        return average_update  # Return original average if QIFA is disabled
 
     if qifa_velocity is None:
-         logger.warning("QIFA velocity not initialized. Skipping momentum.")
-         return average_update
+        logger.warning("QIFA velocity not initialized. Skipping momentum.")
+        return average_update
 
     if qifa_velocity.shape != average_update.shape:
         logger.error(f"QIFA velocity shape {qifa_velocity.shape} mismatch with average update shape {average_update.shape}. Reinitializing velocity.")
@@ -107,20 +116,10 @@ def apply_qifa_momentum(average_update):
 
     logger.info(f"Applying QIFA momentum (factor: {QIFA_MOMENTUM})...")
     # Update velocity: v = momentum * v + (1 - momentum) * average_update
-    # Note: The original suggestion `velocity = momentum * velocity + (1 - momentum) * update`
-    # was applied inside a loop over *individual* updates. Here we apply it to the *average*.
-    # A common momentum application on the *gradient* (update) is: v = momentum * v + update; weight -= learning_rate * v
-    # Let's adapt the user's formula applied to the *average* update:
     qifa_velocity = QIFA_MOMENTUM * qifa_velocity + (1 - QIFA_MOMENTUM) * average_update
 
-    # The *returned value* should be the update to apply to the model weights.
-    # Using momentum typically means the velocity *is* the update direction/magnitude
-    # after scaling by a learning rate (implicit here).
-    # So, we return the updated velocity.
-    # Alternative: return average_update + momentum * velocity (Nesterov-like)
-    # Let's stick closer to the idea of velocity representing the adjusted update direction.
     logger.info("QIFA momentum applied.")
-    return qifa_velocity # Return the velocity as the adjusted update
+    return qifa_velocity  # Return the velocity as the adjusted update
 
 
 def update_global_model(aggregated_decrypted_updates, num_clients):
@@ -128,10 +127,10 @@ def update_global_model(aggregated_decrypted_updates, num_clients):
     Updates the global model using the averaged decrypted updates,
     optionally applying QIFA momentum.
     """
-    global qifa_velocity # Ensure we can access/update the state
+    global qifa_velocity  # Ensure we can access/update the state
     if num_clients == 0:
         logger.warning("Cannot update model with zero clients.")
-        return
+        return load_model()  # Return current model unchanged
 
     global_model = load_model()
     current_weights = get_model_weights(global_model)
@@ -140,14 +139,18 @@ def update_global_model(aggregated_decrypted_updates, num_clients):
     average_scaled_update = np.array(aggregated_decrypted_updates) / num_clients
     average_update = average_scaled_update / PRECISION_FACTOR
 
+    # Log update magnitude to track learning
+    update_norm = np.linalg.norm(average_update)
+    logger.info(f"Average update magnitude: {update_norm:.6f}")
+
     # --- Apply QIFA Momentum (if enabled) ---
     if ENABLE_QIFA_MOMENTUM:
         final_update = apply_qifa_momentum(average_update)
     else:
-        final_update = average_update # Use standard average if QIFA disabled
+        final_update = average_update  # Use standard average if QIFA disabled
 
     # Apply the final update to the current weights
-    new_weights = current_weights + final_update # Add the (potentially momentum-adjusted) average update
+    new_weights = current_weights + final_update  # Add the (potentially momentum-adjusted) average update
 
     # Set the updated weights back to the model
     updated_model = set_model_weights(global_model, new_weights)
@@ -159,19 +162,22 @@ def update_global_model(aggregated_decrypted_updates, num_clients):
 
 
 def evaluate_model_and_trigger_action(model):
-    # ... (no changes needed)
+    """Simulates evaluation and autonomous action based on the model's predictions."""
     from .config import THREAT_THRESHOLD, MODEL_FEATURE_COUNT
     try:
         num_samples = 10
-        potential_threat_data = np.random.rand(num_samples, MODEL_FEATURE_COUNT) * 2
-        potential_threat_data[:, -3:] *= 5
+        # Create more distinctive potential threat data
+        potential_threat_data = np.random.rand(num_samples, MODEL_FEATURE_COUNT) * 0.3
+        # Last 3 features have higher values for threats
+        potential_threat_data[:, -3:] = 0.7 + np.random.rand(num_samples, 3) * 0.3
+        
         probabilities = model.predict_proba(potential_threat_data)
         threat_probabilities = probabilities[:, 1]
         avg_threat_prob = np.mean(threat_probabilities)
         logger.info(f"Simulated evaluation: Average threat probability on sample data: {avg_threat_prob:.4f}")
+        
         if avg_threat_prob > THREAT_THRESHOLD:
             logger.warning(f"AUTONOMOUS ACTION TRIGGERED: Average threat probability {avg_threat_prob:.4f} exceeds threshold {THREAT_THRESHOLD}.")
             print("\n *** SIMULATING AUTONOMOUS ACTION: Blocking potentially malicious source (simulated) *** \n")
-            pass
     except Exception as e:
         logger.error(f"Error during model evaluation or action trigger: {e}")
