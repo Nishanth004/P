@@ -1,174 +1,265 @@
-# server/crypto_manager.py
-import phe as paillier
-import json
+# server/main.py
+from flask import Flask, request, jsonify
 import logging
-import numpy as np # Added for QKD simulation
-from .config import HE_KEY_SIZE, QKD_KEY_LENGTH # Import QKD config
+import time
+import threading
+import json # Added for parsing
+from concurrent.futures import ThreadPoolExecutor
 
-logging.basicConfig(level=logging.INFO)
+
+import sys
+sys.path.append("..")  # Add parent directory to path
+from benchmark_tracker import BenchmarkTracker
+
+from . import crypto_manager
+from . import model_manager
+from .config import (
+    SERVER_HOST, SERVER_PORT, NUM_ROUNDS, CLIENTS_PER_ROUND,
+    MIN_CLIENTS_FOR_AGGREGATION, ENABLE_QKD_SIMULATION,ENABLE_QIFA_MOMENTUM, QKD_KEY_LENGTH
+) # Import QKD config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-public_key, private_key = None, None
-# Store simulated QKD state per client if needed for more complex simulation
-# For simple BB84 simulation, we can generate Bob's part on the fly
-qkd_shared_keys = {} # Store derived keys per client_id {client_id: shared_key_string}
+app = Flask(__name__)
 
-def generate_keys():
-    """Generates Paillier key pair."""
-    global public_key, private_key
-    logger.info(f"Generating Paillier key pair with size {HE_KEY_SIZE} bits...")
-    public_key, private_key = paillier.generate_paillier_keypair(n_length=HE_KEY_SIZE)
-    logger.info("Key pair generated.")
-    return public_key, private_key
+# ... (executor, global state variables remain the same) ...
+client_registry = {} # client_id -> last_seen
+round_updates = {} # round_number -> {client_id: encrypted_update_json}
+current_round = 0
+global_model = None
+server_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=4)
 
-def get_public_key():
-    """Returns the public key object."""
-    if not public_key:
-        generate_keys()
-    return public_key
+def initialize_server():
+    """Initialize server components."""
+    global global_model
+    logger.info("Initializing orchestrator server...")
+    crypto_manager.generate_keys() # Generates HE keys
+    global_model = model_manager.load_model() # Loads model & initializes QIFA velocity
+    logger.info("Server initialized.")
 
-def get_serialized_public_key():
-    """Returns the public key serialized for transmission."""
-    pub_key = get_public_key()
-    # Serialize public key for sending via JSON
-    pub_key_json = {'n': str(pub_key.n)}
-    return json.dumps(pub_key_json)
+# --- Modified Registration Endpoint for QKD Simulation ---
+@app.route('/register', methods=['POST'])
+def register_client():
+    """Allows clients to register. Optionally performs simulated QKD."""
+    data = request.json
+    client_id = data.get('client_id')
+    if not client_id:
+        return jsonify({"error": "Client ID required"}), 400
 
+    serialized_he_pub_key = crypto_manager.get_serialized_public_key()
+    qkd_bases_bob = None
+    qkd_shared_key = None # Store the derived key conceptually
 
-def get_private_key():
-    """Returns the private key."""
-    if not private_key:
-        generate_keys()
-    return private_key
-
-# --- QKD Simulation (BB84 - Server Side: Bob) ---
-
-def simulate_qkd_server_protocol(client_id, alice_bases_str):
-    """
-    Simulates the server (Bob) side of BB84 key exchange.
-    Receives Alice's bases, generates Bob's, compares, and derives a shared key.
-
-    Args:
-        client_id (str): Identifier for the client.
-        alice_bases_str (str): Client's (Alice's) chosen bases as a comma-separated string.
-
-    Returns:
-        tuple: (bob_bases_str, shared_key_str) where
-               bob_bases_str is Bob's chosen bases (comma-separated string).
-               shared_key_str is the derived shared key (hex string) or None on error.
-    """
-    try:
-        alice_bases = np.array([int(b) for b in alice_bases_str.split(',')])
-        key_length = len(alice_bases) # Use the length sent by Alice
-
-        # Bob generates his random bases for measurement
-        bob_bases = np.random.randint(0, 2, key_length)
-
-        # In a real protocol, Bob measures Alice's qubits using his bases.
-        # Here, we simulate the *result* of the public comparison phase.
-        # Indices where Alice and Bob used the same basis are kept.
-        matched_indices = np.where(alice_bases == bob_bases)[0]
-
-        # Simulate Alice sending her *bits* for the matched indices (or Bob deriving them)
-        # In this simplified simulation, we just generate a key of appropriate length directly
-        # A real simulation would involve Alice sending bits and checking a subset for errors.
-        num_matched_bits = len(matched_indices)
-        if num_matched_bits < QKD_KEY_LENGTH: # Check if enough bits survived for the target key length
-            logger.warning(f"QKD for {client_id}: Not enough matched bases ({num_matched_bits}) to generate {QKD_KEY_LENGTH} bit key. Simulation yields fewer bits.")
-            # Handle this case - perhaps request retry or use fewer bits
-            if num_matched_bits == 0: return (','.join(map(str, bob_bases)), None) # No key possible
-            effective_key_length = num_matched_bits
+    # --- Simulated QKD Exchange ---
+    if ENABLE_QKD_SIMULATION:
+        alice_bases_str = data.get('qkd_alice_bases')
+        if alice_bases_str:
+            logger.info(f"QKD Simulation: Received Alice's bases from {client_id}. Simulating Bob's side...")
+            qkd_bases_bob, qkd_shared_key = crypto_manager.simulate_qkd_server_protocol(client_id, alice_bases_str)
+            if qkd_shared_key:
+                logger.info(f"QKD Simulation: Derived shared key for {client_id}. This key would ideally encrypt the HE public key transmission.")
+                # In a real implementation:
+                # encrypted_he_pub_key = encrypt_with_aes_gcm(serialized_he_pub_key, qkd_shared_key)
+                # response_data['encrypted_he_public_key'] = encrypted_he_pub_key
+            else:
+                logger.error(f"QKD Simulation Failed for {client_id}. Proceeding without QKD protection.")
+                # Fallback: Send unencrypted (as done currently) or deny registration
         else:
-             # Select a subset of matched indices to form the key
-             selected_indices = np.random.choice(matched_indices, QKD_KEY_LENGTH, replace=False)
-             effective_key_length = QKD_KEY_LENGTH
+            logger.warning(f"Client {client_id} registered but did not provide QKD bases (QKD enabled).")
+            # Decide policy: allow registration without QKD or deny? Allowing for now.
 
-        # Simulate the final shared key bits (these would come from Alice's original bits)
-        # For simulation, we just generate random bits for the agreed length
-        final_shared_key_bits = np.random.randint(0, 2, effective_key_length)
+    # Store client info (simplified)
+    with server_lock:
+        client_registry[client_id] = {'last_seen': time.time(), 'qkd_key': qkd_shared_key}
 
-        # Store and return the key (e.g., as a hex string)
-        # In a real system, use bytes: shared_key_bytes = bytes(final_shared_key_bits)
-        shared_key_hex = hex(int("".join(map(str, final_shared_key_bits)), 2))[2:] # Convert bit array to hex string
+    # Prepare response
+    response_data = {
+        "message": "Registered successfully",
+        "public_key": json.loads(serialized_he_pub_key), # Send standard public key (simulation only)
+        "feature_count": model_manager.MODEL_FEATURE_COUNT
+    }
+    if qkd_bases_bob is not None:
+         response_data["qkd_bob_bases"] = qkd_bases_bob # Send Bob's bases for client reconciliation simulation
 
-        qkd_shared_keys[client_id] = shared_key_hex
-        logger.info(f"QKD Simulation for {client_id}: Successfully derived simulated shared key of length {effective_key_length} bits.")
+    logger.info(f"Client {client_id} registered.")
+    return jsonify(response_data)
 
-        bob_bases_str = ','.join(map(str, bob_bases))
-        return bob_bases_str, shared_key_hex # In simulation, we return key directly for logging
+# --- /get_model endpoint (Unchanged) ---
+@app.route('/get_model', methods=['GET'])
+def get_model():
+    # ... (no changes needed) ...
+    client_id = request.args.get('client_id')
+    request_round = request.args.get('round', type=int)
+    if not client_id or client_id not in client_registry:
+         return jsonify({"error": "Client not registered or invalid ID"}), 403
+    if request_round != current_round:
+         return jsonify({"error": f"Requesting model for wrong round ({request_round}), current is {current_round}"}), 400
+    model_weights = model_manager.get_model_weights(global_model)
+    logger.info(f"Sending model (round {current_round}) to client {client_id}")
+    return jsonify({
+        "round": current_round,
+        "weights": model_weights.tolist()
+        })
 
-    except Exception as e:
-        logger.error(f"Error during QKD server simulation for {client_id}: {e}", exc_info=True)
-        return (','.join(map(str, bob_bases)) if 'bob_bases' in locals() else "", None)
+
+# --- /submit_update endpoint (Unchanged) ---
+@app.route('/submit_update', methods=['POST'])
+def submit_update():
+    # ... (no changes needed) ...
+    data = request.json
+    client_id = data.get('client_id')
+    round_num = data.get('round')
+    encrypted_update_json = data.get('update') # This is already JSON string from client
+
+    if not client_id or client_id not in client_registry:
+        return jsonify({"error": "Client not registered or invalid ID"}), 403
+    if round_num != current_round:
+        return jsonify({"error": f"Update submitted for wrong round ({round_num}), current is {current_round}"}), 400
+    if not encrypted_update_json:
+         return jsonify({"error": "Encrypted update missing"}), 400
+
+    with server_lock:
+        if current_round not in round_updates:
+            round_updates[current_round] = {}
+        if client_id in round_updates[current_round]:
+            logger.warning(f"Client {client_id} already submitted update for round {current_round}. Ignoring.")
+            return jsonify({"message": "Update already received for this round"}), 200
+
+        round_updates[current_round][client_id] = encrypted_update_json
+        logger.info(f"Received encrypted update from {client_id} for round {current_round}. Total updates this round: {len(round_updates[current_round])}")
+
+        if len(round_updates[current_round]) >= MIN_CLIENTS_FOR_AGGREGATION:
+             logger.info(f"Minimum updates ({MIN_CLIENTS_FOR_AGGREGATION}) reached for round {current_round}. Aggregation can proceed.")
+
+    return jsonify({"message": "Update received successfully"})
 
 
-# --- HE Operations (Unchanged) ---
+# --- Modified Federated Round Logic ---
+def run_federated_round(round_num):
+    """Manages a single round of federated learning."""
+    global global_model, current_round
+    logger.info(f"--- Starting Federated Round {round_num} ---")
 
-def decrypt_value(encrypted_value_json):
-    # ... (no changes needed)
-    priv_key = get_private_key()
-    try:
-        encrypted_data = json.loads(encrypted_value_json)
-        encrypted_number = paillier.EncryptedNumber(get_public_key(),
-                                                    int(encrypted_data['ciphertext']),
-                                                    int(encrypted_data['exponent']))
-        decrypted_value = priv_key.decrypt(encrypted_number)
-        return decrypted_value
-    except Exception as e:
-        logger.error(f"Decryption failed for value: {encrypted_value_json}. Error: {e}")
-        raise
+    with server_lock:
+        current_round = round_num
+        round_updates[current_round] = {} # Clear updates for the new round
 
-def decrypt_vector(encrypted_vector_json):
-    # ... (no changes needed)
-    priv_key = get_private_key()
-    pub_key = get_public_key()
-    encrypted_vector_list = json.loads(encrypted_vector_json)
-    decrypted_vector = []
-    for item in encrypted_vector_list:
+    logger.info(f"Waiting for client updates for round {round_num}...")
+    round_start_time = time.time()
+    wait_time_seconds = 60
+
+    while time.time() - round_start_time < wait_time_seconds:
+        with server_lock:
+             num_received = len(round_updates.get(current_round, {}))
+        if num_received >= MIN_CLIENTS_FOR_AGGREGATION:
+             logger.info(f"Round {current_round}: Reached minimum {num_received} updates. Proceeding early.")
+             break
+        time.sleep(5)
+
+    # --- Aggregation and Update ---
+    with server_lock:
+        updates_to_process = round_updates.get(current_round, {})
+        num_updates = len(updates_to_process)
+        logger.info(f"Round {current_round} ended. Received {num_updates} updates.")
+
+        if num_updates < MIN_CLIENTS_FOR_AGGREGATION:
+            logger.warning(f"Round {current_round}: Not enough updates ({num_updates}) received. Skipping model update for this round.")
+            return
+
+        # Submit aggregation and decryption to the thread pool
+        logger.info("Submitting aggregation and decryption tasks to executor...")
+        # Pass the list of encrypted update JSON strings
+        future = executor.submit(aggregate_and_decrypt, list(updates_to_process.values()))
+
         try:
-            encrypted_number = paillier.EncryptedNumber(pub_key,
-                                                        int(item['ciphertext']),
-                                                        int(item['exponent']))
-            decrypted_value = priv_key.decrypt(encrypted_number)
-            decrypted_vector.append(decrypted_value)
+            # Result is the decrypted *sum* of scaled updates
+            aggregated_decrypted_updates = future.result(timeout=120)
+
+            if aggregated_decrypted_updates:
+                logger.info("Aggregation and decryption complete. Updating global model.")
+                # The update function now handles averaging and QIFA momentum internally
+                global_model = model_manager.update_global_model(aggregated_decrypted_updates, num_updates)
+
+                logger.info("Evaluating model and checking for autonomous actions...")
+                model_manager.evaluate_model_and_trigger_action(global_model)
+
+            else:
+                logger.error("Aggregation/decryption failed or returned no result.")
+
         except Exception as e:
-            logger.error(f"Decryption failed for item: {item}. Error: {e}")
-            continue # Skip this element for now
-    return decrypted_vector
+            logger.error(f"Error during aggregation/decryption task execution: {e}", exc_info=True)
+
+    logger.info(f"--- Federated Round {round_num} Complete ---")
 
 
-def aggregate_encrypted_vectors(encrypted_vectors):
-    # ... (no changes needed)
-    if not encrypted_vectors:
-        return None
+def aggregate_and_decrypt(encrypted_updates_list):
+    """
+    Aggregates encrypted updates and decrypts the sum.
+    Args:
+        encrypted_updates_list (list): List of JSON strings, each an encrypted vector.
+    Returns:
+        list: The decrypted aggregated vector (list of integers) or None on failure.
+    """
+    num_clients = len(encrypted_updates_list)
+    if num_clients == 0: return None
+    try:
+        logger.info(f"Aggregating {num_clients} encrypted vectors using HE...")
+        aggregated_encrypted_json = crypto_manager.aggregate_encrypted_vectors(encrypted_updates_list)
+        if aggregated_encrypted_json is None:
+            logger.error("HE Aggregation resulted in None.")
+            return None
 
-    pub_key = get_public_key()
-    aggregated_vector = None
+        logger.info("Decrypting aggregated vector...")
+        start_decrypt_time = time.time()
+        # Decrypts the single aggregated vector
+        aggregated_decrypted_updates = crypto_manager.decrypt_vector(aggregated_encrypted_json)
+        decrypt_time = time.time() - start_decrypt_time
+        logger.info(f"Decryption took {decrypt_time:.4f} seconds.")
 
-    # Deserialize and sum
-    for enc_vec_json in encrypted_vectors:
-        enc_vec_list = json.loads(enc_vec_json)
-        if aggregated_vector is None:
-            # Initialize aggregated_vector with the first vector
-            aggregated_vector = [paillier.EncryptedNumber(pub_key, int(item['ciphertext']), int(item['exponent']))
-                                 for item in enc_vec_list]
-        else:
-            if len(aggregated_vector) != len(enc_vec_list):
-                logger.warning(f"Skipping vector due to length mismatch. Expected {len(aggregated_vector)}, got {len(enc_vec_list)}")
-                continue
-            # Add the current vector element-wise
-            for i, item in enumerate(enc_vec_list):
-                try:
-                    current_enc_num = paillier.EncryptedNumber(pub_key, int(item['ciphertext']), int(item['exponent']))
-                    aggregated_vector[i] += current_enc_num
-                except Exception as e:
-                     logger.error(f"Error aggregating item at index {i}: {item}. Error: {e}")
-                     continue # Skip this element addition
+        return aggregated_decrypted_updates # Return the list of decrypted summed integers
+    except Exception as e:
+         logger.error(f"Error in aggregate_and_decrypt: {e}", exc_info=True)
+         return None
 
-    # Serialize the result back to JSON representation for storage/decryption
-    if aggregated_vector:
-         serialized_aggregate = json.dumps([{'ciphertext': str(num.ciphertext(be_secure=False)), 'exponent': num.exponent}
-                                       for num in aggregated_vector])
-         return serialized_aggregate
-    else:
-        return None
+
+def run_server():
+    initialize_server()
+    
+    # Initialize benchmark tracker
+    experiment_name = "qifa_qkd" if ENABLE_QKD_SIMULATION and ENABLE_QIFA_MOMENTUM else \
+                      "qifa" if ENABLE_QIFA_MOMENTUM else \
+                      "qkd" if ENABLE_QKD_SIMULATION else "baseline"
+    
+    tracker = BenchmarkTracker(experiment_name=experiment_name)
+    
+    flask_thread = threading.Thread(target=lambda: app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True), daemon=True)
+    flask_thread.start()
+    logger.info(f"Flask server running on http://{SERVER_HOST}:{SERVER_PORT}")
+
+    # Run federated learning rounds
+    for r in range(NUM_ROUNDS):
+        run_federated_round(r)
+        
+        # Evaluate model after each round
+        logger.info(f"Evaluating model performance after round {r}")
+        tracker.evaluate_model(r)
+        
+        # Save results after each round for immediate inspection
+        tracker.save_results()
+        
+        time.sleep(5)
+    
+    # Generate convergence plots
+    tracker.plot_convergence(metric='accuracy')
+    tracker.plot_convergence(metric='f1')
+    tracker.plot_convergence(metric='precision')
+    tracker.plot_convergence(metric='recall')
+    tracker.plot_multi_metric()
+    
+    logger.info("Federated learning process finished.")
+    logger.info(f"Benchmark results saved to {tracker.results_dir}")
+
+if __name__ == '__main__':
+    run_server()
