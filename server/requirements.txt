@@ -1,0 +1,6 @@
+Flask>=2.0
+numpy>=1.20
+scikit-learn>=1.0
+phe==1.5.0
+requests # Although server doesn't make requests, keep consistent env
+joblib>=1.0
