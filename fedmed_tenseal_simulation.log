@@ -1,0 +1,33 @@
+2025-05-11 06:43:25,558 - INFO - [main_tenseal.py:22] - FEDMED-TenSEAL Simulation Started with SEED: 42
+2025-05-11 06:43:25,559 - INFO - [main_tenseal.py:23] - Device: cpu
+2025-05-11 06:43:25,559 - INFO - [data_loader.py:21] - Loading and preprocessing data...
+2025-05-11 06:43:25,784 - INFO - [data_loader.py:87] - Data preprocessed. Input dimension: 27
+2025-05-11 06:43:25,784 - INFO - [data_loader.py:88] - Training samples: 44553, Test samples: 11139
+2025-05-11 06:43:25,787 - INFO - [data_loader.py:107] - Calculated pos_weight for BCEWithLogitsLoss: 1.7226
+2025-05-11 06:43:25,791 - INFO - [server_tenseal.py:26] - Server: Creating TenSEAL CKKS context using create_tenseal_context from utils...
+2025-05-11 06:43:25,965 - INFO - [server_tenseal.py:28] - Server: TenSEAL context created and keys generated.
+2025-05-11 06:43:26,413 - INFO - [server_tenseal.py:42] - Server: Serialized public TenSEAL context for clients (size: 470654 bytes).
+2025-05-11 06:43:26,414 - INFO - [main_tenseal.py:55] - Total clients: 2
+2025-05-11 06:43:26,414 - INFO - [main_tenseal.py:56] - Noisy clients (0): []
+2025-05-11 06:43:26,414 - INFO - [main_tenseal.py:57] - Adversarial clients (0): []
+2025-05-11 06:43:27,290 - INFO - [main_tenseal.py:79] - --- Round 1/2 ---
+2025-05-11 06:43:27,290 - INFO - [main_tenseal.py:87] - Selected 2 clients for round 1: [1, 0]
+2025-05-11 06:43:28,135 - INFO - [client_tenseal.py:136] - Client 1: Local training complete. Avg Overall Loss: 0.6556, Quality Score: 1.5253, Samples: 22277
+2025-05-11 06:43:28,902 - INFO - [client_tenseal.py:136] - Client 0: Local training complete. Avg Overall Loss: 0.6540, Quality Score: 1.5291, Samples: 22276
+2025-05-11 06:43:28,903 - INFO - [server_tenseal.py:98] - Server: Aggregation weights: [0.4994396 0.5005604]
+2025-05-11 06:43:28,916 - INFO - [server_tenseal.py:134] - Server: Global model updated.
+2025-05-11 06:43:29,152 - INFO - [server_tenseal.py:165] - Server: Global model evaluation - Test Loss: 0.6197, Accuracy: 0.7194, F1: 0.7044, Precision: 0.5744, Recall: 0.9103
+2025-05-11 06:43:29,153 - INFO - [main_tenseal.py:79] - --- Round 2/2 ---
+2025-05-11 06:43:29,153 - INFO - [main_tenseal.py:87] - Selected 2 clients for round 2: [0, 1]
+2025-05-11 06:43:29,895 - INFO - [client_tenseal.py:136] - Client 0: Local training complete. Avg Overall Loss: 0.6202, Quality Score: 1.6125, Samples: 22276
+2025-05-11 06:43:30,646 - INFO - [client_tenseal.py:136] - Client 1: Local training complete. Avg Overall Loss: 0.6181, Quality Score: 1.6178, Samples: 22277
+2025-05-11 06:43:30,647 - INFO - [server_tenseal.py:98] - Server: Aggregation weights: [0.49926062 0.50073938]
+2025-05-11 06:43:30,659 - INFO - [server_tenseal.py:134] - Server: Global model updated.
+2025-05-11 06:43:30,901 - INFO - [server_tenseal.py:165] - Server: Global model evaluation - Test Loss: 0.6146, Accuracy: 0.7345, F1: 0.7073, Precision: 0.5943, Recall: 0.8734
+2025-05-11 06:43:30,903 - INFO - [main_tenseal.py:114] - --- Federated Training Complete (TenSEAL) ---
+2025-05-11 06:43:30,903 - INFO - [utils_tenseal.py:136] - Plotting metrics to fedmed_tenseal_performance.png...
+2025-05-11 06:43:31,510 - INFO - [utils_tenseal.py:167] - Metrics plot saved to fedmed_tenseal_performance.png
+2025-05-11 06:43:31,510 - INFO - [main_tenseal.py:119] - --- Demonstrating New Client Prediction (TenSEAL Model) ---
+2025-05-11 06:43:31,512 - INFO - [main_tenseal.py:128] - Predicting for a sample with true label: 0.0
+2025-05-11 06:43:31,512 - INFO - [main_tenseal.py:133] - Raw output: -3.8572, Prediction probability (smoker): 0.0207, Predicted class: 0
+2025-05-11 06:43:31,512 - INFO - [main_tenseal.py:137] - FEDMED-TenSEAL Simulation Finished.
